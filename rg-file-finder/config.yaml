@@ -1,0 +1,37 @@
+sources:
+  - name: project-a
+    path: 'C:\workspace\project-a'
+
+  - name: project-b
+    path: 'D:\workspace\project-b'
+
+extensions:
+  - sql
+  - java
+  - js
+  - jsp
+
+include_keywords:
+  - policy
+  - customer
+
+exclude_keywords:
+  - test
+  - backup
+  - temp
+  - old
+
+exclude_folders:
+  - .git
+  - target
+  - node_modules
+  - dist
+
+search:
+  ignore_case: true
+  include_hidden: false
+  respect_gitignore: true
+
+output:
+  folder: 'D:\rg-output'
+  md_filename: 'search_result.md'
