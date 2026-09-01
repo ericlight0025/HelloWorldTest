@@ -1,0 +1,103 @@
+name: Temporary RG GUI Windows Test
+
+on:
+  push:
+    branches:
+      - add-rg-file-finder-gui
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+          choco install ripgrep -y --no-progress
+
+      - name: Compile and import
+        shell: pwsh
+        run: |
+          python -m py_compile rg-file-finder/finder.py rg-file-finder/gui.py
+          @'
+          import sys
+          sys.path.insert(0, 'rg-file-finder')
+          import finder
+          import gui
+          import tkinter
+          print('Tk version:', tkinter.TkVersion)
+          '@ | python -
+
+      - name: Core Windows end-to-end test
+        shell: pwsh
+        run: |
+          @'
+          import sys
+          import tempfile
+          from pathlib import Path
+          sys.path.insert(0, 'rg-file-finder')
+          from finder import load_config, search_files, export_files, generate_markdown
+
+          with tempfile.TemporaryDirectory() as td:
+              base = Path(td)
+              a = base / 'sourceA' / 'src'
+              b = base / 'sourceB' / 'web'
+              target = base / 'sourceA' / 'target'
+              output = base / 'output'
+              a.mkdir(parents=True)
+              b.mkdir(parents=True)
+              target.mkdir(parents=True)
+              output.mkdir()
+
+              (a / 'PolicyService.java').write_text('policy active', encoding='utf-8')
+              (a / 'Customer.sql').write_text('select customer', encoding='utf-8')
+              (a / 'BackupPolicy.sql').write_text('policy backup', encoding='utf-8')
+              (target / 'Hidden.java').write_text('policy customer', encoding='utf-8')
+              (b / 'check.js').write_text('CUSTOMER portal', encoding='utf-8')
+              (b / 'view.jsp').write_text('policy and customer', encoding='utf-8')
+              (b / 'readme.txt').write_text('policy', encoding='utf-8')
+
+              config_path = base / 'config.yaml'
+              config_path.write_text(f'''sources:
+            - name: project-a
+              path: "{str(base / 'sourceA').replace(chr(92), '/')}"
+            - name: project-b
+              path: "{str(base / 'sourceB').replace(chr(92), '/')}"
+          extensions: [sql, java, js, jsp]
+          include_keywords: [policy, customer]
+          exclude_keywords: [backup]
+          exclude_folders: [target]
+          search:
+            ignore_case: true
+            include_hidden: false
+            respect_gitignore: true
+          output:
+            folder: "{str(output).replace(chr(92), '/')}"
+            preserve_structure: true
+            overwrite: false
+            md_filename: search_result.md
+          ''', encoding='utf-8')
+
+              config = load_config(config_path)
+              results = search_files(config)
+              names = [r.file_name for r in results]
+              assert names == ['check.js', 'Customer.sql', 'PolicyService.java', 'view.jsp'], names
+              by_name = {r.file_name: r for r in results}
+              selected = [by_name['Customer.sql'], by_name['view.jsp']]
+              exported = export_files(selected, config['output'], message_handler=lambda _: None)
+              assert all(x.copied for x in exported)
+              exported2 = export_files(selected, config['output'], message_handler=lambda _: None)
+              assert all(not x.copied and x.reason == 'Already Exists' for x in exported2)
+              md = generate_markdown(config=config, yaml_path=config_path, total_results=4, exported=exported)
+              text = md.read_text(encoding='utf-8')
+              assert 'Total Matched: 4' in text
+              assert 'Copied: 2' in text
+              print('WINDOWS_CORE_E2E: PASS')
+          '@ | python -
