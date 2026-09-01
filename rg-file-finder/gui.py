@@ -6,6 +6,7 @@ export_files 與 generate_markdown。
 
 from __future__ import annotations
 
+import queue
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -36,9 +37,11 @@ class RGFileFinderGUI(tk.Tk):
         self.config_data: dict[str, Any] | None = None
         self.raw_yaml = ""
         self.results: list[SearchResult] = []
+        self._events: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self._build_ui()
         self._set_status("請先載入 YAML 設定檔。")
+        self.after(50, self._drain_events)
 
     def _build_ui(self) -> None:
         """建立主畫面。"""
@@ -122,6 +125,27 @@ class RGFileFinderGUI(tk.Tk):
         else:
             self.progress.stop()
 
+    def _drain_events(self) -> None:
+        """只在 Tk 主執行緒處理背景工作結果，避免跨執行緒操作 GUI。"""
+        try:
+            while True:
+                event, payload = self._events.get_nowait()
+                if event == "search_failed":
+                    self._search_failed(str(payload))
+                elif event == "search_finished":
+                    results, warnings = payload
+                    self._search_finished(results, warnings)
+                elif event == "copy_failed":
+                    self._copy_failed(str(payload))
+                elif event == "copy_finished":
+                    exported, md_path, messages = payload
+                    self._copy_finished(exported, md_path, messages)
+        except queue.Empty:
+            pass
+
+        if self.winfo_exists():
+            self.after(50, self._drain_events)
+
     def load_yaml(self) -> None:
         """讓使用者選取 YAML 並載入設定。"""
         selected = filedialog.askopenfilename(
@@ -191,10 +215,10 @@ class RGFileFinderGUI(tk.Tk):
         try:
             results = search_files(self.config_data, warning_handler=warnings.append)
         except FinderError as exc:
-            self.after(0, self._search_failed, str(exc))
+            self._events.put(("search_failed", str(exc)))
             return
 
-        self.after(0, self._search_finished, results, warnings)
+        self._events.put(("search_finished", (results, warnings)))
 
     def _search_failed(self, message: str) -> None:
         """處理搜尋錯誤。"""
@@ -285,10 +309,10 @@ class RGFileFinderGUI(tk.Tk):
                 exported=exported,
             )
         except FinderError as exc:
-            self.after(0, self._copy_failed, str(exc))
+            self._events.put(("copy_failed", str(exc)))
             return
 
-        self.after(0, self._copy_finished, exported, md_path, messages)
+        self._events.put(("copy_finished", (exported, md_path, messages)))
 
     def _copy_failed(self, message: str) -> None:
         """處理複製錯誤。"""
