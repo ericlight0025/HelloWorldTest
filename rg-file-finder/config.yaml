@@ -39,5 +39,7 @@ security:
 output:
   folder: 'D:\rg-output'
   preserve_structure: true
-  overwrite: false
+  # 原始檔案預設不覆寫；報告可每次更新。
+  overwrite_files: false
+  overwrite_report: true
   md_filename: 'search_result.md'
