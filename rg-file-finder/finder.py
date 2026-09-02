@@ -397,7 +397,10 @@ def export_files(
             relative = source_file.relative_to(source_root) if preserve else Path(source_file.name)
             destination = output_root / source_name / relative
 
+            # 在建立任何目的資料夾前先解析現有 symlink/junction，避免先在根目錄外產生副作用。
+            _ensure_within(output_root_resolved, destination, "輸出路徑")
             destination.parent.mkdir(parents=True, exist_ok=True)
+            # 建立後再驗一次，縮小 TOCTOU 與中間層被替換的風險。
             _ensure_within(output_root_resolved, destination, "輸出路徑")
 
             if destination.exists() and not overwrite:
