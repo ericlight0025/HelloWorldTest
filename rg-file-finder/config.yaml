@@ -32,6 +32,10 @@ search:
   include_hidden: false
   respect_gitignore: true
 
+security:
+  # 預設拒絕 UNC/network path；若確定信任遠端來源才改為 true。
+  allow_network_paths: false
+
 output:
   folder: 'D:\rg-output'
   preserve_structure: true

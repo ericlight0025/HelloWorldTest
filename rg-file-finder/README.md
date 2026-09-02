@@ -1,18 +1,8 @@
 # RG File Finder
 
-RG File Finder 是以 `ripgrep (rg)` 為底層的 YAML-driven 檔案內容搜尋工具，提供：
+RG File Finder 是以 `ripgrep (rg)` 為底層的 YAML-driven 檔案內容搜尋工具，提供 Menu CLI 與 Tkinter GUI，支援多來源資料夾、指定副檔名、Include / Exclude 關鍵字、排除資料夾、多檔選取與複製，以及 Markdown 搜尋報告。
 
-- Menu CLI
-- Tkinter GUI
-- 多來源資料夾搜尋
-- `.sql`、`.java`、`.js`、`.jsp` 等副檔名篩選
-- Include / Exclude 關鍵字
-- 排除指定資料夾
-- 多檔選取與複製
-- Markdown 搜尋報告
-- Windows GitHub Actions 測試
-
-CLI 與 GUI 共用同一份 `finder.py` 核心，避免搜尋、匯出與 Markdown 邏輯重複實作。
+CLI 與 GUI 共用 `finder.py` 核心，搜尋、匯出與報告邏輯集中管理。
 
 ## 系統需求
 
@@ -21,133 +11,44 @@ CLI 與 GUI 共用同一份 `finder.py` 核心，避免搜尋、匯出與 Markdo
 - PyYAML
 - Tkinter（GUI 使用）
 
-安裝 Python 相依套件：
+安裝：
 
 ```bash
 python -m pip install -r requirements.txt
-```
-
-確認 ripgrep：
-
-```bash
 rg --version
 ```
 
-若要執行測試：
+測試：
 
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-## 執行 CLI
+## 執行
 
-進入 `rg-file-finder` 目錄後：
+CLI：
 
 ```bash
 python main.py
 ```
 
-主選單：
+GUI：
+
+```bash
+python gui.py
+```
+
+CLI 選單：
 
 ```text
-========================================
-          RG File Finder
-========================================
-
-目前 YAML：
-尚未載入
-
 1. 載入 YAML 設定檔
 2. 執行搜尋、選擇檔案並輸出
 3. 檢視 YAML 內容
 0. 離開
 ```
 
-## 執行 GUI
-
-進入 `rg-file-finder` 目錄後：
-
-```bash
-python gui.py
-```
-
-GUI 支援：
-
-- 選擇並載入 YAML
-- 查看 YAML 原始內容
-- 背景執行搜尋，不阻塞視窗
-- 多選搜尋結果
-- 全選 / 取消全選
-- 背景複製檔案
-- 產生 Markdown 報告
-- 搜尋結果為 0 時仍產生 Markdown
-
-背景作業使用 Queue 將結果交回 Tk 主執行緒更新 UI；執行搜尋或複製期間，會暫停可改變狀態的按鈕，避免重複啟動工作或切換 YAML 造成 race condition。
-
-## 操作流程
-
-### 1. 載入 YAML
-
-CLI 選擇 `1` 後需輸入 YAML 絕對路徑：
-
-```text
-D:\config\rg-search.yaml
-```
-
-GUI 則可直接使用檔案選擇器。
-
-程式會驗證：
-
-- YAML 檔案存在
-- 副檔名為 `.yaml` 或 `.yml`
-- YAML 可解析
-- `sources`、`extensions`、`include_keywords` 至少一筆
-- 每個 source 具備 `name` 與 `path`
-- `source.name` 不可包含路徑字元
-- `search.*` 布林設定必須是 `true` / `false`
-- `output.folder` 已設定
-- `output.md_filename` 只能是單一檔名，不可包含路徑或 `..`
-
-### 2. 搜尋、選擇、輸出
-
-CLI 選擇 `2` 後完全依 YAML 執行，不再要求輸入 keyword、source、extension 或 output。
-
-搜尋的是檔案內容，底層使用：
-
-```text
-rg --files-with-matches --fixed-strings
-```
-
-搜尋結果會顯示：
-
-- 編號
-- 檔名
-- Source
-- 完整路徑
-- 命中的 include keyword
-
-CLI 選擇格式支援：
-
-```text
-1
-1,3,5
-1,3,5-8
-1,3,5-8,12
-all
-```
-
-`all` 代表全部選取。
-
-GUI 可直接使用多選方式選取結果。
-
-選取後會把實體檔案複製到 `output.folder`，並產生 Markdown 報告。
-
-### 3. 檢視 YAML
-
-CLI 選擇 `3` 或 GUI 點選「查看 YAML」都會顯示目前 YAML 的原始文字。
-
-程式不重新 serialize YAML，因此原有縮排與註解可保留。
+GUI 支援載入與查看 YAML、背景搜尋、多選結果、全選 / 取消全選、背景複製與 Markdown 報告。背景工作透過 Queue 回到 Tk 主執行緒更新 UI，執行期間會鎖定會改變狀態的操作，避免重複工作與 race condition。
 
 ## YAML 範例
 
@@ -172,8 +73,6 @@ include_keywords:
 exclude_keywords:
   - test
   - backup
-  - temp
-  - old
 
 exclude_folders:
   - .git
@@ -186,6 +85,9 @@ search:
   include_hidden: false
   respect_gitignore: true
 
+security:
+  allow_network_paths: false
+
 output:
   folder: 'D:\rg-output'
   preserve_structure: true
@@ -195,33 +97,34 @@ output:
 
 ## 搜尋規則
 
-### include_keywords
+- `include_keywords` 採 OR；命中任一關鍵字即成為候選。
+- `exclude_keywords` 命中任一關鍵字則排除整個檔案。
+- `extensions` 只允許安全副檔名格式，不接受 glob 萬用字元。
+- `exclude_folders` 不允許 glob 萬用字元，避免 YAML 改寫預期搜尋範圍。
+- 關鍵字、來源數、副檔名數與排除資料夾數都有上限，避免惡意或誤設 YAML 造成大量重複掃描。
 
-採 OR。檔案內容只要命中任一 include keyword 即成為候選結果。
+目前核心仍採每個 include / exclude keyword 分別呼叫 ripgrep。若未來大型專案量測到效能瓶頸，再評估單次 `rg --json` 掃描。
 
-### exclude_keywords
+## Security Hardening
 
-只要候選檔案內容命中任一 exclude keyword，整個檔案就排除。
+此工具會讀取 YAML 指定的本機來源並將檔案寫入指定輸出位置，因此若 YAML 來自第三方，應視為不可信輸入。
 
-### extensions
+目前防護包含：
 
-只搜尋 YAML 指定的副檔名。
+- `subprocess.run()` 使用參數陣列，不使用 `shell=True`。
+- 關鍵字前使用 ripgrep `--`，並搭配 `--fixed-strings`，避免關鍵字被解析為命令列選項或正規表示式。
+- `source.name` 與 `output.md_filename` 只能是單一安全名稱，拒絕 `/`、`\`、`..`、控制字元、Windows 保留名稱，以及句點 / 空白結尾名稱。
+- 預設拒絕 UNC / network path；只有明確設定 `security.allow_network_paths: true` 才允許。
+- 搜尋結果解析後必須仍位於原始 source root 內。
+- 匯出前會解析 symlink / junction，確認 destination 仍位於 `output.folder` 內；建立目的資料夾前後各檢查一次，避免路徑逃逸與外部目錄副作用。
+- `overwrite: false` 同時套用於複製檔案與 Markdown 報告，避免既有檔案被無條件覆寫。
+- Markdown 會 escape YAML 路徑、關鍵字、檔名與狀態等外部文字，避免內容改寫報告結構。
 
-### exclude_folders
-
-透過 ripgrep glob 排除指定資料夾，例如 `.git`、`target`、`node_modules`、`dist`。
-
-### search
-
-- `ignore_case`：忽略大小寫
-- `include_hidden`：包含隱藏檔案
-- `respect_gitignore`：遵守 `.gitignore`
+`allow_network_paths: true` 代表使用者自行選擇允許 UNC / network path。只應對可信任來源使用。
 
 ## 輸出規則
 
-### preserve_structure: true
-
-保留來源內的相對路徑：
+`preserve_structure: true`：
 
 ```text
 D:\rg-output\
@@ -232,9 +135,7 @@ D:\rg-output\
           PolicyService.java
 ```
 
-### preserve_structure: false
-
-只保留 Source 層與檔名：
+`preserve_structure: false`：
 
 ```text
 D:\rg-output\
@@ -242,42 +143,13 @@ D:\rg-output\
     PolicyService.java
 ```
 
-### overwrite: false
-
-目的檔已存在時略過，不覆寫。
-
-### overwrite: true
-
-允許覆寫既有檔案。
+`overwrite: false` 時，既有輸出檔案不會被覆寫；既有 Markdown 報告也會直接回報錯誤。`overwrite: true` 才允許覆寫。
 
 ## Markdown
 
-預設 `search_result.md` 會包含：
+預設 `search_result.md` 包含 YAML path、Sources、Extensions、Include / Exclude Keywords、Total Matched、Selected、Copied、Skipped、原始路徑、Destination、Matched Keywords 與 Copy Status。
 
-- YAML path
-- Sources
-- Extensions
-- Include Keywords
-- Exclude Keywords
-- Total Matched
-- Selected
-- Copied
-- Skipped
-- 每個選取檔案的原始路徑
-- Destination
-- Matched Keywords
-- Copy Status
-
-Markdown 不包含原始檔案完整內容。
-
-即使搜尋結果為 0，仍會產生：
-
-```text
-Total Matched: 0
-Selected: 0
-Copied: 0
-Skipped: 0
-```
+Markdown 不包含原始檔案完整內容。搜尋結果為 0 時仍會產生摘要；但若同名 Markdown 已存在且 `overwrite: false`，不會覆蓋舊報告。
 
 ## 專案架構
 
@@ -299,42 +171,29 @@ HelloWorldTest/
         └── test_main.py
 ```
 
-### `main.py`
+## Regression Tests
 
-- Menu CLI
-- YAML path state
-- 顯示搜尋結果
-- 解析使用者選擇
-- 呼叫 Core
+安全測試涵蓋：
 
-### `gui.py`
-
-- Tkinter GUI
-- Queue + main-thread UI 更新
-- 背景搜尋與複製
-- Busy 狀態鎖定
-- 設定與結果 snapshot，避免 worker 讀取到變更後的狀態
-
-### `finder.py`
-
-- `load_config()`
-- `validate_config()`
-- `search_files()`
-- `export_files()`
-- `generate_markdown()`
-- YAML 路徑安全驗證
-- ripgrep 啟動與錯誤處理
+- 不安全 `source.name` / Markdown filename
+- Windows `CON`、`NUL`、`COM1`、`LPT9` 等保留名稱
+- 預設拒絕 UNC source / output
+- 明確允許 network path 的 opt-in 行為
+- glob extension / exclude folder 拒絕
+- keyword 數量與長度限制
+- source file 不可逃出 source root
+- symlink destination escape
+- Markdown `overwrite: false`
+- Markdown escape
+- CLI selection parser
 
 ## CI
 
-當 `rg-file-finder/**` 或 workflow 本身有變更時，GitHub Actions 會在 Windows runner 上執行：
+GitHub Actions 使用 Python 3.13，並在以下兩個 runner 執行 compile 與 pytest：
 
 ```text
-Python 3.13
-ripgrep install
-pip install
-py_compile
-pytest
+windows-latest
+ubuntu-latest
 ```
 
-這可以避免未來修改 CLI、GUI 或核心後，只有人工測試紀錄而沒有可重複驗證的 regression test。
+Windows 主要覆蓋實際使用環境與 Windows path 行為；Ubuntu runner 補充可穩定建立 symlink 的 containment regression test。

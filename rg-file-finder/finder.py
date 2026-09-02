@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -9,6 +11,23 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import yaml
+
+
+MAX_SOURCES = 50
+MAX_EXTENSIONS = 50
+MAX_TOTAL_KEYWORDS = 50
+MAX_KEYWORD_LENGTH = 256
+MAX_EXCLUDE_FOLDERS = 100
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+_EXTENSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$")
 
 
 class FinderError(RuntimeError):
@@ -41,13 +60,62 @@ class ExportResult:
 
 
 def _validate_safe_component(value: Any, field_name: str) -> str:
-    """驗證只能作為單一檔名或資料夾名稱的文字，避免路徑穿越。"""
+    """驗證只能作為單一 Windows/Linux 檔名或資料夾名稱的文字。"""
     if not isinstance(value, str) or not value.strip():
         raise FinderError(f"{field_name} 必須是非空白文字。")
 
     text = value.strip()
     if text in {".", ".."} or "/" in text or "\\" in text or ":" in text or "\x00" in text:
         raise FinderError(f"{field_name} 不可包含路徑、磁碟代號或特殊路徑字元：{value}")
+    if any(ord(char) < 32 for char in text):
+        raise FinderError(f"{field_name} 不可包含控制字元。")
+    if text.endswith((".", " ")):
+        raise FinderError(f"{field_name} 不可用句點或空白結尾。")
+
+    windows_base = text.split(".", 1)[0].upper()
+    if windows_base in _WINDOWS_RESERVED_NAMES:
+        raise FinderError(f"{field_name} 不可使用 Windows 保留名稱：{value}")
+    return text
+
+
+def _is_network_path(value: str) -> bool:
+    """判斷 UNC、POSIX network-style 與 Windows device namespace 路徑。"""
+    text = value.strip()
+    return text.startswith("\\\\") or text.startswith("//")
+
+
+def _validate_local_path(value: Any, field_name: str, *, allow_network_paths: bool) -> str:
+    """驗證 YAML 路徑文字；預設拒絕 UNC/network path。"""
+    if not isinstance(value, str) or not value.strip():
+        raise FinderError(f"{field_name} 必須是非空白文字。")
+    text = value.strip()
+    if "\x00" in text or any(ord(char) < 32 for char in text):
+        raise FinderError(f"{field_name} 不可包含控制字元。")
+    if not allow_network_paths and _is_network_path(text):
+        raise FinderError(f"{field_name} 預設不允許 UNC/network path：{value}")
+    return text
+
+
+def _ensure_within(root: Path, candidate: Path, field_name: str) -> Path:
+    """解析 symlink/junction 後確認 candidate 仍位於 root 內。"""
+    try:
+        resolved_root = root.resolve(strict=False)
+        resolved_candidate = candidate.resolve(strict=False)
+    except OSError as exc:
+        raise FinderError(f"無法解析 {field_name}：{exc}") from exc
+
+    if not resolved_candidate.is_relative_to(resolved_root):
+        raise FinderError(f"{field_name} 超出允許的根目錄：{candidate}")
+    return resolved_candidate
+
+
+def _escape_markdown(value: Any) -> str:
+    """將外部輸入轉為單行且不會改寫 Markdown 結構的文字。"""
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    text = html.escape(text, quote=False)
+    text = text.replace("\\", "\\\\")
+    for char in ("`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", "!", "|", ">"):
+        text = text.replace(char, f"\\{char}")
     return text
 
 
@@ -72,7 +140,7 @@ def load_config(config_path: Path | str) -> dict[str, Any]:
 
 
 def validate_config(config: Any) -> None:
-    """確認內容搜尋與輸出所需的 YAML 欄位與基本型別。"""
+    """確認內容搜尋、資源限制與輸出安全所需的 YAML 欄位。"""
     if not isinstance(config, dict):
         raise FinderError("YAML 根節點必須是 mapping。")
 
@@ -86,26 +154,62 @@ def validate_config(config: Any) -> None:
         if not isinstance(value, list) or not value:
             raise FinderError(f"YAML 欄位 {field} 必須至少有一筆設定。")
 
+    if len(config["sources"]) > MAX_SOURCES:
+        raise FinderError(f"sources 最多允許 {MAX_SOURCES} 筆。")
+    if len(config["extensions"]) > MAX_EXTENSIONS:
+        raise FinderError(f"extensions 最多允許 {MAX_EXTENSIONS} 筆。")
+
+    security = config.get("security", {})
+    if not isinstance(security, dict):
+        raise FinderError("YAML 欄位 security 必須是 mapping。")
+    allow_network_paths = security.get("allow_network_paths", False)
+    if not isinstance(allow_network_paths, bool):
+        raise FinderError("security.allow_network_paths 必須是 true 或 false。")
+
     for index, source in enumerate(config["sources"], 1):
         if not isinstance(source, dict) or not source.get("name") or not source.get("path"):
             raise FinderError(f"sources 第 {index} 筆必須包含 name 與 path。")
         _validate_safe_component(source["name"], f"sources 第 {index} 筆 name")
-        if not isinstance(source["path"], str) or not source["path"].strip():
-            raise FinderError(f"sources 第 {index} 筆 path 必須是非空白文字。")
+        _validate_local_path(
+            source["path"],
+            f"sources 第 {index} 筆 path",
+            allow_network_paths=allow_network_paths,
+        )
 
     if not all(isinstance(item, str) and item.strip() for item in config["extensions"]):
         raise FinderError("extensions 每一筆都必須是非空白文字。")
+    for item in config["extensions"]:
+        extension = item.strip().lstrip(".")
+        if not _EXTENSION_PATTERN.fullmatch(extension):
+            raise FinderError(f"extensions 包含不安全或不支援的格式：{item}")
 
     if not all(isinstance(item, str) and item.strip() for item in config["include_keywords"]):
         raise FinderError("include_keywords 每一筆都必須是非空白文字。")
 
-    for optional in ("exclude_keywords", "exclude_folders"):
-        if optional in config:
-            value = config[optional]
-            if not isinstance(value, list):
-                raise FinderError(f"YAML 欄位 {optional} 必須是 list。")
-            if not all(isinstance(item, str) for item in value):
-                raise FinderError(f"YAML 欄位 {optional} 每一筆都必須是文字。")
+    exclude_keywords = config.get("exclude_keywords", [])
+    if not isinstance(exclude_keywords, list) or not all(isinstance(item, str) for item in exclude_keywords):
+        raise FinderError("YAML 欄位 exclude_keywords 必須是文字 list。")
+
+    total_keywords = len(config["include_keywords"]) + len(exclude_keywords)
+    if total_keywords > MAX_TOTAL_KEYWORDS:
+        raise FinderError(f"include/exclude keywords 合計最多允許 {MAX_TOTAL_KEYWORDS} 筆。")
+    for keyword in [*config["include_keywords"], *exclude_keywords]:
+        if not keyword.strip():
+            raise FinderError("關鍵字不可為空白文字。")
+        if len(keyword) > MAX_KEYWORD_LENGTH:
+            raise FinderError(f"單一關鍵字最多允許 {MAX_KEYWORD_LENGTH} 個字元。")
+        if "\x00" in keyword:
+            raise FinderError("關鍵字不可包含 NUL 字元。")
+
+    exclude_folders = config.get("exclude_folders", [])
+    if not isinstance(exclude_folders, list) or not all(isinstance(item, str) for item in exclude_folders):
+        raise FinderError("YAML 欄位 exclude_folders 必須是文字 list。")
+    if len(exclude_folders) > MAX_EXCLUDE_FOLDERS:
+        raise FinderError(f"exclude_folders 最多允許 {MAX_EXCLUDE_FOLDERS} 筆。")
+    for folder in exclude_folders:
+        safe_folder = _validate_safe_component(folder, "exclude_folders 項目")
+        if any(char in safe_folder for char in "*?[]{}"):
+            raise FinderError(f"exclude_folders 不可包含 glob 萬用字元：{folder}")
 
     search = config.get("search", {})
     if not isinstance(search, dict):
@@ -117,8 +221,11 @@ def validate_config(config: Any) -> None:
     output = config["output"]
     if not isinstance(output, dict) or not output.get("folder"):
         raise FinderError("YAML 必須設定 output.folder。")
-    if not isinstance(output["folder"], str) or not output["folder"].strip():
-        raise FinderError("output.folder 必須是非空白文字。")
+    _validate_local_path(
+        output["folder"],
+        "output.folder",
+        allow_network_paths=allow_network_paths,
+    )
 
     for option in ("preserve_structure", "overwrite"):
         if option in output and not isinstance(output[option], bool):
@@ -207,9 +314,13 @@ def search_files(
 
     warn = warning_handler or print
     extensions = _normalise_extensions(config["extensions"])
-    includes = [str(item).strip() for item in config["include_keywords"] if str(item).strip()]
-    excludes = [str(item).strip() for item in config.get("exclude_keywords", []) if str(item).strip()]
-    exclude_folders = [str(item) for item in config.get("exclude_folders", [])]
+    includes = list(dict.fromkeys(str(item).strip() for item in config["include_keywords"] if str(item).strip()))
+    excludes = list(
+        dict.fromkeys(str(item).strip() for item in config.get("exclude_keywords", []) if str(item).strip())
+    )
+    exclude_folders = list(
+        dict.fromkeys(str(item).strip() for item in config.get("exclude_folders", []) if str(item).strip())
+    )
     search_options = config.get("search", {})
     results: list[SearchResult] = []
 
@@ -224,12 +335,15 @@ def search_files(
 
         for keyword in includes:
             for path in _search_keyword(root, keyword, extensions, exclude_folders, search_options):
-                matched_by_file.setdefault(path, []).append(keyword)
+                if path.is_relative_to(root):
+                    matched_by_file.setdefault(path, []).append(keyword)
 
         excluded_paths: set[Path] = set()
         for keyword in excludes:
             excluded_paths.update(
-                _search_keyword(root, keyword, extensions, exclude_folders, search_options)
+                path
+                for path in _search_keyword(root, keyword, extensions, exclude_folders, search_options)
+                if path.is_relative_to(root)
             )
 
         for path, matched_keywords in matched_by_file.items():
@@ -258,7 +372,7 @@ def export_files(
     *,
     message_handler: Callable[[str], None] | None = None,
 ) -> list[ExportResult]:
-    """複製所選檔案，保留 source 層以避免不同來源的同名檔互相覆蓋。"""
+    """複製所選檔案，並防止 symlink/junction 讓輸出逃出 output root。"""
     output_root = Path(str(output_config["folder"])).expanduser()
     preserve = bool(output_config.get("preserve_structure", True))
     overwrite = bool(output_config.get("overwrite", False))
@@ -266,6 +380,7 @@ def export_files(
 
     try:
         output_root.mkdir(parents=True, exist_ok=True)
+        output_root_resolved = output_root.resolve(strict=False)
     except OSError as exc:
         raise FinderError(f"無法建立輸出資料夾：{exc}") from exc
 
@@ -274,8 +389,19 @@ def export_files(
     for item in selected:
         source_name = _validate_safe_component(item.source_name, "source_name")
         try:
-            relative = item.file_path.relative_to(item.source_root) if preserve else Path(item.file_name)
+            source_root = item.source_root.resolve(strict=False)
+            source_file = item.file_path.resolve(strict=True)
+            if not source_file.is_relative_to(source_root):
+                raise FinderError(f"來源檔案超出來源根目錄：{item.file_path}")
+
+            relative = source_file.relative_to(source_root) if preserve else Path(source_file.name)
             destination = output_root / source_name / relative
+
+            # 在建立任何目的資料夾前先解析現有 symlink/junction，避免先在根目錄外產生副作用。
+            _ensure_within(output_root_resolved, destination, "輸出路徑")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # 建立後再驗一次，縮小 TOCTOU 與中間層被替換的風險。
+            _ensure_within(output_root_resolved, destination, "輸出路徑")
 
             if destination.exists() and not overwrite:
                 reason = "Already Exists"
@@ -283,11 +409,12 @@ def export_files(
                 exported.append(ExportResult(item, destination, False, reason))
                 continue
 
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item.file_path, destination)
+            shutil.copy2(source_file, destination)
             notify(f"[複製] {destination}")
             exported.append(ExportResult(item, destination, True, None))
 
+        except FinderError:
+            raise
         except (OSError, ValueError) as exc:
             raise FinderError(f"複製檔案失敗：{item.file_path}\n{exc}") from exc
 
@@ -301,10 +428,11 @@ def generate_markdown(
     total_results: int,
     exported: Sequence[ExportResult],
 ) -> Path:
-    """在 output.folder 產生搜尋條件、摘要與選取檔案的 Markdown 報告。"""
+    """在 output.folder 安全產生搜尋條件、摘要與選取檔案 Markdown 報告。"""
     validate_config(config)
     output_config = config["output"]
     output_root = Path(str(output_config["folder"])).expanduser()
+    overwrite = bool(output_config.get("overwrite", False))
     md_filename = _validate_safe_component(
         str(output_config.get("md_filename", "search_result.md")),
         "output.md_filename",
@@ -319,19 +447,19 @@ def generate_markdown(
         "## Search Conditions",
         "",
         "YAML:",
-        str(yaml_path),
+        _escape_markdown(yaml_path),
         "",
         "Sources:",
-        *[f"- {source['path']}" for source in config["sources"]],
+        *[f"- {_escape_markdown(source['path'])}" for source in config["sources"]],
         "",
         "Extensions:",
-        *[f"- {item}" for item in _normalise_extensions(config["extensions"])],
+        *[f"- {_escape_markdown(item)}" for item in _normalise_extensions(config["extensions"])],
         "",
         "Include Keywords:",
-        *[f"- {item}" for item in config["include_keywords"]],
+        *[f"- {_escape_markdown(item)}" for item in config["include_keywords"]],
         "",
         "Exclude Keywords:",
-        *[f"- {item}" for item in config.get("exclude_keywords", [])],
+        *[f"- {_escape_markdown(item)}" for item in config.get("exclude_keywords", [])],
         "",
         "## Search Summary",
         "",
@@ -350,30 +478,36 @@ def generate_markdown(
 
         lines.extend(
             [
-                f"### {index}. {item.file_name}",
+                f"### {index}. {_escape_markdown(item.file_name)}",
                 "",
                 "Source:",
-                item.source_name,
+                _escape_markdown(item.source_name),
                 "",
                 "Original Path:",
-                str(item.file_path),
+                _escape_markdown(item.file_path),
                 "",
                 "Destination:",
-                str(record.destination),
+                _escape_markdown(record.destination),
                 "",
                 "Matched Keywords:",
-                *[f"- {keyword}" for keyword in item.matched_keywords],
+                *[f"- {_escape_markdown(keyword)}" for keyword in item.matched_keywords],
                 "",
                 "Status:",
-                status,
+                _escape_markdown(status),
                 "",
             ]
         )
 
     try:
         output_root.mkdir(parents=True, exist_ok=True)
+        output_root_resolved = output_root.resolve(strict=False)
         md_path = output_root / md_filename
+        _ensure_within(output_root_resolved, md_path, "Markdown 輸出路徑")
+        if md_path.exists() and not overwrite:
+            raise FinderError(f"Markdown 已存在且 overwrite=false：{md_path}")
         md_path.write_text("\n".join(lines), encoding="utf-8")
+    except FinderError:
+        raise
     except OSError as exc:
         raise FinderError(f"無法建立輸出或 Markdown：{exc}") from exc
 
