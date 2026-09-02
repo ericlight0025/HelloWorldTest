@@ -1,0 +1,42 @@
+name: RG File Finder Tests
+
+on:
+  pull_request:
+    paths:
+      - 'rg-file-finder/**'
+      - '.github/workflows/rg-file-finder-test.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'rg-file-finder/**'
+      - '.github/workflows/rg-file-finder-test.yml'
+
+jobs:
+  test:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: rg-file-finder
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install ripgrep
+        run: choco install ripgrep -y
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Compile Python files
+        run: python -m py_compile finder.py main.py gui.py
+
+      - name: Run tests
+        run: python -m pytest -q
