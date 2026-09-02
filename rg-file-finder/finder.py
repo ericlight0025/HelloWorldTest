@@ -40,6 +40,17 @@ class ExportResult:
     reason: str | None = None
 
 
+def _validate_safe_component(value: Any, field_name: str) -> str:
+    """驗證只能作為單一檔名或資料夾名稱的文字，避免路徑穿越。"""
+    if not isinstance(value, str) or not value.strip():
+        raise FinderError(f"{field_name} 必須是非空白文字。")
+
+    text = value.strip()
+    if text in {".", ".."} or "/" in text or "\\" in text or ":" in text or "\x00" in text:
+        raise FinderError(f"{field_name} 不可包含路徑、磁碟代號或特殊路徑字元：{value}")
+    return text
+
+
 def load_config(config_path: Path | str) -> dict[str, Any]:
     """讀取並驗證 YAML 設定檔。"""
     path = Path(config_path)
@@ -78,6 +89,9 @@ def validate_config(config: Any) -> None:
     for index, source in enumerate(config["sources"], 1):
         if not isinstance(source, dict) or not source.get("name") or not source.get("path"):
             raise FinderError(f"sources 第 {index} 筆必須包含 name 與 path。")
+        _validate_safe_component(source["name"], f"sources 第 {index} 筆 name")
+        if not isinstance(source["path"], str) or not source["path"].strip():
+            raise FinderError(f"sources 第 {index} 筆 path 必須是非空白文字。")
 
     if not all(isinstance(item, str) and item.strip() for item in config["extensions"]):
         raise FinderError("extensions 每一筆都必須是非空白文字。")
@@ -96,10 +110,22 @@ def validate_config(config: Any) -> None:
     search = config.get("search", {})
     if not isinstance(search, dict):
         raise FinderError("YAML 欄位 search 必須是 mapping。")
+    for option in ("ignore_case", "include_hidden", "respect_gitignore"):
+        if option in search and not isinstance(search[option], bool):
+            raise FinderError(f"search.{option} 必須是 true 或 false。")
 
     output = config["output"]
     if not isinstance(output, dict) or not output.get("folder"):
         raise FinderError("YAML 必須設定 output.folder。")
+    if not isinstance(output["folder"], str) or not output["folder"].strip():
+        raise FinderError("output.folder 必須是非空白文字。")
+
+    for option in ("preserve_structure", "overwrite"):
+        if option in output and not isinstance(output[option], bool):
+            raise FinderError(f"output.{option} 必須是 true 或 false。")
+
+    if "md_filename" in output:
+        _validate_safe_component(output["md_filename"], "output.md_filename")
 
 
 def _normalise_extensions(extensions: Iterable[str]) -> list[str]:
@@ -157,6 +183,8 @@ def _search_keyword(
         )
     except FileNotFoundError as exc:
         raise FinderError("系統找不到 ripgrep（rg）。請先執行 rg --version 確認安裝。") from exc
+    except OSError as exc:
+        raise FinderError(f"ripgrep 無法啟動：{exc}") from exc
 
     if completed.returncode not in (0, 1):
         detail = completed.stderr.strip() or f"結束代碼 {completed.returncode}"
@@ -244,9 +272,10 @@ def export_files(
     exported: list[ExportResult] = []
 
     for item in selected:
+        source_name = _validate_safe_component(item.source_name, "source_name")
         try:
             relative = item.file_path.relative_to(item.source_root) if preserve else Path(item.file_name)
-            destination = output_root / item.source_name / relative
+            destination = output_root / source_name / relative
 
             if destination.exists() and not overwrite:
                 reason = "Already Exists"
@@ -273,9 +302,13 @@ def generate_markdown(
     exported: Sequence[ExportResult],
 ) -> Path:
     """在 output.folder 產生搜尋條件、摘要與選取檔案的 Markdown 報告。"""
+    validate_config(config)
     output_config = config["output"]
     output_root = Path(str(output_config["folder"])).expanduser()
-    md_filename = str(output_config.get("md_filename", "search_result.md"))
+    md_filename = _validate_safe_component(
+        str(output_config.get("md_filename", "search_result.md")),
+        "output.md_filename",
+    )
 
     copied = sum(1 for item in exported if item.copied)
     skipped = len(exported) - copied
