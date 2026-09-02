@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import yaml
 
 
+MAX_YAML_BYTES = 1024 * 1024
 MAX_SOURCES = 50
 MAX_EXTENSIONS = 50
 MAX_TOTAL_KEYWORDS = 50
@@ -109,6 +110,41 @@ def _ensure_within(root: Path, candidate: Path, field_name: str) -> Path:
     return resolved_candidate
 
 
+def _validate_source_output_separation(source_path: str, output_path: str, source_name: str) -> None:
+    """拒絕 source 與 output 互相包含，避免輸出檔在後續搜尋中被再次掃描。"""
+    if _is_network_path(source_path) or _is_network_path(output_path):
+        return
+
+    try:
+        source = Path(source_path).expanduser().resolve(strict=False)
+        output = Path(output_path).expanduser().resolve(strict=False)
+    except OSError as exc:
+        raise FinderError(f"無法解析 source/output 路徑：{exc}") from exc
+
+    if source == output or output.is_relative_to(source) or source.is_relative_to(output):
+        raise FinderError(
+            f"source 與 output.folder 不可互相包含：{source_name} -> {source}；output -> {output}"
+        )
+
+
+def _overwrite_files_enabled(output_config: Mapping[str, Any]) -> bool:
+    """取得檔案覆寫設定；新欄位優先，舊 overwrite 保持相容。"""
+    if "overwrite_files" in output_config:
+        return bool(output_config["overwrite_files"])
+    if "overwrite" in output_config:
+        return bool(output_config["overwrite"])
+    return False
+
+
+def _overwrite_report_enabled(output_config: Mapping[str, Any]) -> bool:
+    """取得報告覆寫設定；新欄位優先，舊 overwrite 保持相容。"""
+    if "overwrite_report" in output_config:
+        return bool(output_config["overwrite_report"])
+    if "overwrite" in output_config:
+        return bool(output_config["overwrite"])
+    return True
+
+
 def _escape_markdown(value: Any) -> str:
     """將外部輸入轉為單行且不會改寫 Markdown 結構的文字。"""
     text = str(value).replace("\r", "\\r").replace("\n", "\\n")
@@ -126,6 +162,16 @@ def load_config(config_path: Path | str) -> dict[str, Any]:
         raise FinderError(f"YAML 設定檔不存在：{path}")
     if path.suffix.lower() not in {".yaml", ".yml"}:
         raise FinderError("設定檔副檔名必須是 .yaml 或 .yml。")
+
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise FinderError(f"無法取得 YAML 檔案資訊：{exc}") from exc
+
+    if file_size > MAX_YAML_BYTES:
+        raise FinderError(
+            f"YAML 檔案過大：{file_size} bytes；上限為 {MAX_YAML_BYTES} bytes。"
+        )
 
     try:
         with path.open("r", encoding="utf-8") as stream:
@@ -166,15 +212,24 @@ def validate_config(config: Any) -> None:
     if not isinstance(allow_network_paths, bool):
         raise FinderError("security.allow_network_paths 必須是 true 或 false。")
 
+    source_names: set[str] = set()
+    validated_sources: list[tuple[str, str]] = []
     for index, source in enumerate(config["sources"], 1):
         if not isinstance(source, dict) or not source.get("name") or not source.get("path"):
             raise FinderError(f"sources 第 {index} 筆必須包含 name 與 path。")
-        _validate_safe_component(source["name"], f"sources 第 {index} 筆 name")
-        _validate_local_path(
+
+        source_name = _validate_safe_component(source["name"], f"sources 第 {index} 筆 name")
+        source_key = source_name.casefold()
+        if source_key in source_names:
+            raise FinderError(f"source.name 必須唯一，重複名稱：{source_name}")
+        source_names.add(source_key)
+
+        source_path = _validate_local_path(
             source["path"],
             f"sources 第 {index} 筆 path",
             allow_network_paths=allow_network_paths,
         )
+        validated_sources.append((source_name, source_path))
 
     if not all(isinstance(item, str) and item.strip() for item in config["extensions"]):
         raise FinderError("extensions 每一筆都必須是非空白文字。")
@@ -221,18 +276,21 @@ def validate_config(config: Any) -> None:
     output = config["output"]
     if not isinstance(output, dict) or not output.get("folder"):
         raise FinderError("YAML 必須設定 output.folder。")
-    _validate_local_path(
+    output_path = _validate_local_path(
         output["folder"],
         "output.folder",
         allow_network_paths=allow_network_paths,
     )
 
-    for option in ("preserve_structure", "overwrite"):
+    for option in ("preserve_structure", "overwrite", "overwrite_files", "overwrite_report"):
         if option in output and not isinstance(output[option], bool):
             raise FinderError(f"output.{option} 必須是 true 或 false。")
 
     if "md_filename" in output:
         _validate_safe_component(output["md_filename"], "output.md_filename")
+
+    for source_name, source_path in validated_sources:
+        _validate_source_output_separation(source_path, output_path, source_name)
 
 
 def _normalise_extensions(extensions: Iterable[str]) -> list[str]:
@@ -375,7 +433,7 @@ def export_files(
     """複製所選檔案，並防止 symlink/junction 讓輸出逃出 output root。"""
     output_root = Path(str(output_config["folder"])).expanduser()
     preserve = bool(output_config.get("preserve_structure", True))
-    overwrite = bool(output_config.get("overwrite", False))
+    overwrite_files = _overwrite_files_enabled(output_config)
     notify = message_handler or print
 
     try:
@@ -403,7 +461,7 @@ def export_files(
             # 建立後再驗一次，縮小 TOCTOU 與中間層被替換的風險。
             _ensure_within(output_root_resolved, destination, "輸出路徑")
 
-            if destination.exists() and not overwrite:
+            if destination.exists() and not overwrite_files:
                 reason = "Already Exists"
                 notify(f"[跳過] 已存在：{destination}")
                 exported.append(ExportResult(item, destination, False, reason))
@@ -432,7 +490,7 @@ def generate_markdown(
     validate_config(config)
     output_config = config["output"]
     output_root = Path(str(output_config["folder"])).expanduser()
-    overwrite = bool(output_config.get("overwrite", False))
+    overwrite_report = _overwrite_report_enabled(output_config)
     md_filename = _validate_safe_component(
         str(output_config.get("md_filename", "search_result.md")),
         "output.md_filename",
@@ -503,8 +561,8 @@ def generate_markdown(
         output_root_resolved = output_root.resolve(strict=False)
         md_path = output_root / md_filename
         _ensure_within(output_root_resolved, md_path, "Markdown 輸出路徑")
-        if md_path.exists() and not overwrite:
-            raise FinderError(f"Markdown 已存在且 overwrite=false：{md_path}")
+        if md_path.exists() and not overwrite_report:
+            raise FinderError(f"Markdown 已存在且 overwrite_report=false：{md_path}")
         md_path.write_text("\n".join(lines), encoding="utf-8")
     except FinderError:
         raise
