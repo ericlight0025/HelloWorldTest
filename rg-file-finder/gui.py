@@ -6,6 +6,7 @@ export_files 與 generate_markdown。
 
 from __future__ import annotations
 
+import copy
 import queue
 import threading
 import tkinter as tk
@@ -38,6 +39,7 @@ class RGFileFinderGUI(tk.Tk):
         self.raw_yaml = ""
         self.results: list[SearchResult] = []
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._busy = False
 
         self._build_ui()
         self._set_status("請先載入 YAML 設定檔。")
@@ -52,22 +54,31 @@ class RGFileFinderGUI(tk.Tk):
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(1, weight=1)
 
-        ttk.Button(top, text="載入 YAML", command=self.load_yaml).grid(row=0, column=0, padx=(0, 8))
+        self.load_button = ttk.Button(top, text="載入 YAML", command=self.load_yaml)
+        self.load_button.grid(row=0, column=0, padx=(0, 8))
 
         self.yaml_var = tk.StringVar()
         ttk.Entry(top, textvariable=self.yaml_var, state="readonly").grid(
             row=0, column=1, sticky="ew", padx=(0, 8)
         )
 
-        ttk.Button(top, text="查看 YAML", command=self.view_yaml).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(top, text="執行搜尋", command=self.run_search).grid(row=0, column=3)
+        self.view_button = ttk.Button(top, text="查看 YAML", command=self.view_yaml)
+        self.view_button.grid(row=0, column=2, padx=(0, 8))
+
+        self.search_button = ttk.Button(top, text="執行搜尋", command=self.run_search)
+        self.search_button.grid(row=0, column=3)
 
         action = ttk.Frame(self, padding=(10, 0, 10, 8))
         action.grid(row=1, column=0, sticky="ew")
 
-        ttk.Button(action, text="全選", command=self.select_all).pack(side="left")
-        ttk.Button(action, text="取消全選", command=self.clear_selection).pack(side="left", padx=(8, 0))
-        ttk.Button(action, text="複製選取檔案", command=self.copy_selected).pack(side="left", padx=(16, 0))
+        self.select_all_button = ttk.Button(action, text="全選", command=self.select_all)
+        self.select_all_button.pack(side="left")
+
+        self.clear_button = ttk.Button(action, text="取消全選", command=self.clear_selection)
+        self.clear_button.pack(side="left", padx=(8, 0))
+
+        self.copy_button = ttk.Button(action, text="複製選取檔案", command=self.copy_selected)
+        self.copy_button.pack(side="left", padx=(16, 0))
 
         self.count_var = tk.StringVar(value="搜尋結果：0")
         ttk.Label(action, textvariable=self.count_var).pack(side="right")
@@ -119,7 +130,20 @@ class RGFileFinderGUI(tk.Tk):
         self.status_var.set(message)
 
     def _set_busy(self, busy: bool) -> None:
-        """切換忙碌狀態。"""
+        """切換忙碌狀態並停用會改變作業狀態的操作按鈕。"""
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+
+        for button in (
+            self.load_button,
+            self.view_button,
+            self.search_button,
+            self.select_all_button,
+            self.clear_button,
+            self.copy_button,
+        ):
+            button.configure(state=state)
+
         if busy:
             self.progress.start(10)
         else:
@@ -133,8 +157,8 @@ class RGFileFinderGUI(tk.Tk):
                 if event == "search_failed":
                     self._search_failed(str(payload))
                 elif event == "search_finished":
-                    results, warnings = payload
-                    self._search_finished(results, warnings)
+                    results, warnings, config_path, config_snapshot = payload
+                    self._search_finished(results, warnings, config_path, config_snapshot)
                 elif event == "copy_failed":
                     self._copy_failed(str(payload))
                 elif event == "copy_finished":
@@ -148,6 +172,9 @@ class RGFileFinderGUI(tk.Tk):
 
     def load_yaml(self) -> None:
         """讓使用者選取 YAML 並載入設定。"""
+        if self._busy:
+            return
+
         selected = filedialog.askopenfilename(
             title="選擇 YAML 設定檔",
             filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")],
@@ -173,6 +200,8 @@ class RGFileFinderGUI(tk.Tk):
 
     def view_yaml(self) -> None:
         """以獨立視窗顯示目前 YAML 原始內容。"""
+        if self._busy:
+            return
         if self.config_path is None:
             messagebox.showinfo("提示", "請先載入 YAML 設定檔。")
             return
@@ -197,28 +226,41 @@ class RGFileFinderGUI(tk.Tk):
 
     def run_search(self) -> None:
         """在背景執行內容搜尋，避免 GUI 搜尋時凍結。"""
-        if self.config_data is None:
+        if self._busy:
+            return
+        if self.config_data is None or self.config_path is None:
             messagebox.showinfo("提示", "請先載入 YAML 設定檔。")
             return
+
+        config_snapshot = copy.deepcopy(self.config_data)
+        config_path_snapshot = self.config_path
 
         self._set_busy(True)
         self._set_status("搜尋中…")
 
-        thread = threading.Thread(target=self._search_worker, daemon=True)
+        thread = threading.Thread(
+            target=self._search_worker,
+            args=(config_snapshot, config_path_snapshot),
+            daemon=True,
+        )
         thread.start()
 
-    def _search_worker(self) -> None:
-        """背景搜尋工作。"""
-        assert self.config_data is not None
+    def _search_worker(self, config_snapshot: dict[str, Any], config_path_snapshot: Path) -> None:
+        """使用不可變動的設定快照執行背景搜尋。"""
         warnings: list[str] = []
 
         try:
-            results = search_files(self.config_data, warning_handler=warnings.append)
+            results = search_files(config_snapshot, warning_handler=warnings.append)
         except FinderError as exc:
             self._events.put(("search_failed", str(exc)))
             return
+        except Exception as exc:
+            self._events.put(("search_failed", f"未預期的搜尋錯誤：{exc}"))
+            return
 
-        self._events.put(("search_finished", (results, warnings)))
+        self._events.put(
+            ("search_finished", (results, warnings, config_path_snapshot, config_snapshot))
+        )
 
     def _search_failed(self, message: str) -> None:
         """處理搜尋錯誤。"""
@@ -226,9 +268,20 @@ class RGFileFinderGUI(tk.Tk):
         self._set_status("搜尋失敗。")
         messagebox.showerror("搜尋失敗", message)
 
-    def _search_finished(self, results: list[SearchResult], warnings: list[str]) -> None:
-        """顯示搜尋結果。"""
+    def _search_finished(
+        self,
+        results: list[SearchResult],
+        warnings: list[str],
+        config_path_snapshot: Path,
+        config_snapshot: dict[str, Any],
+    ) -> None:
+        """顯示同一份設定快照產生的搜尋結果。"""
         self._set_busy(False)
+
+        if self.config_path != config_path_snapshot or self.config_data != config_snapshot:
+            self._set_status("搜尋完成，但設定已變更；結果未套用。")
+            return
+
         self.results = results
         self._refresh_results()
 
@@ -237,7 +290,7 @@ class RGFileFinderGUI(tk.Tk):
 
         if not results:
             self._set_status("搜尋完成：0 筆。")
-            self._generate_empty_markdown()
+            self._generate_empty_markdown(config_snapshot, config_path_snapshot)
             return
 
         self._set_status(f"搜尋完成：{len(results)} 筆。可多選後複製。")
@@ -264,16 +317,22 @@ class RGFileFinderGUI(tk.Tk):
 
     def select_all(self) -> None:
         """選取所有搜尋結果。"""
+        if self._busy:
+            return
         items = self.tree.get_children()
         if items:
             self.tree.selection_set(items)
 
     def clear_selection(self) -> None:
         """取消所有選取。"""
+        if self._busy:
+            return
         self.tree.selection_remove(self.tree.selection())
 
     def copy_selected(self) -> None:
         """複製 GUI 中選取的多筆檔案並產生 Markdown。"""
+        if self._busy:
+            return
         if self.config_data is None or self.config_path is None:
             messagebox.showinfo("提示", "請先載入 YAML 並執行搜尋。")
             return
@@ -283,33 +342,52 @@ class RGFileFinderGUI(tk.Tk):
             messagebox.showinfo("提示", "請先選取至少一個檔案。")
             return
 
-        selected = [self.results[int(item_id)] for item_id in selected_ids]
-        self._set_busy(True)
-        self._set_status(f"正在複製 {len(selected)} 個檔案…")
+        selected_snapshot = [self.results[int(item_id)] for item_id in selected_ids]
+        config_snapshot = copy.deepcopy(self.config_data)
+        config_path_snapshot = self.config_path
+        total_results_snapshot = len(self.results)
 
-        thread = threading.Thread(target=self._copy_worker, args=(selected,), daemon=True)
+        self._set_busy(True)
+        self._set_status(f"正在複製 {len(selected_snapshot)} 個檔案…")
+
+        thread = threading.Thread(
+            target=self._copy_worker,
+            args=(
+                selected_snapshot,
+                config_snapshot,
+                config_path_snapshot,
+                total_results_snapshot,
+            ),
+            daemon=True,
+        )
         thread.start()
 
-    def _copy_worker(self, selected: list[SearchResult]) -> None:
-        """背景複製與 Markdown 產生工作。"""
-        assert self.config_data is not None
-        assert self.config_path is not None
-
+    def _copy_worker(
+        self,
+        selected: list[SearchResult],
+        config_snapshot: dict[str, Any],
+        config_path_snapshot: Path,
+        total_results_snapshot: int,
+    ) -> None:
+        """使用設定快照執行背景複製與 Markdown 產生工作。"""
         messages: list[str] = []
         try:
             exported = export_files(
                 selected,
-                self.config_data["output"],
+                config_snapshot["output"],
                 message_handler=messages.append,
             )
             md_path = generate_markdown(
-                config=self.config_data,
-                yaml_path=self.config_path,
-                total_results=len(self.results),
+                config=config_snapshot,
+                yaml_path=config_path_snapshot,
+                total_results=total_results_snapshot,
                 exported=exported,
             )
         except FinderError as exc:
             self._events.put(("copy_failed", str(exc)))
+            return
+        except Exception as exc:
+            self._events.put(("copy_failed", f"未預期的複製錯誤：{exc}"))
             return
 
         self._events.put(("copy_finished", (exported, md_path, messages)))
@@ -344,15 +422,16 @@ class RGFileFinderGUI(tk.Tk):
             f"Markdown：{md_path}{detail}",
         )
 
-    def _generate_empty_markdown(self) -> None:
-        """搜尋 0 筆時仍產生空的 Markdown 報告。"""
-        if self.config_data is None or self.config_path is None:
-            return
-
+    def _generate_empty_markdown(
+        self,
+        config_snapshot: dict[str, Any],
+        config_path_snapshot: Path,
+    ) -> None:
+        """搜尋 0 筆時仍依同一份設定快照產生空的 Markdown 報告。"""
         try:
             md_path = generate_markdown(
-                config=self.config_data,
-                yaml_path=self.config_path,
+                config=config_snapshot,
+                yaml_path=config_path_snapshot,
                 total_results=0,
                 exported=[],
             )
