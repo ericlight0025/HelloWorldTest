@@ -1,5 +1,12 @@
 package tw.light.scanner;
 
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -31,7 +38,7 @@ import java.util.stream.Stream;
  * java -jar target/sql-call-chain-scanner-1.0.0.jar D:/project order.jsp report.md
  * java -jar target/sql-call-chain-scanner-1.0.0.jar D:/project /order/query report.md
  *
- * 本工具採用靜態文字與簡易方法範圍分析，適合先快速縮小範圍；
+ * Java 方法與呼叫關係使用 AST 解析；JSP、JavaScript、SQL 使用各自的語法規則。
  * Java 反射、字串動態組合、框架代理及 JSP runtime include 仍需人工複核。
  */
 public class SqlCallChainScanner {
@@ -39,10 +46,6 @@ public class SqlCallChainScanner {
     private static final Set<String> EXTENSIONS = Set.of(
             ".java", ".js", ".jsp", ".jspx", ".sql", ".xml", ".html"
     );
-    private static final Pattern JAVA_METHOD = Pattern.compile(
-            "(?m)(?:public|protected|private|static|final|synchronized|native|abstract|\n|\\s)+"
-                    + "[\\w<>?,.\\[\\]]+\\s+(\\w+)\\s*\\([^;{}]*\\)\\s*\\{");
-    private static final Pattern JAVA_CLASS = Pattern.compile("\\bclass\\s+(\\w+)");
     private static final Pattern ANNOTATION_PATH = Pattern.compile(
             "@(GetMapping|PostMapping|PutMapping|DeleteMapping|RequestMapping)\\s*\\([^)]*?['\"]([^'\"]+)['\"]");
     private static final Pattern JS_FUNCTION = Pattern.compile(
@@ -99,19 +102,32 @@ public class SqlCallChainScanner {
     }
 
     private void indexJava(Path path, String text, Node fileNode) {
-        String className = "未知類別";
-        Matcher classMatcher = JAVA_CLASS.matcher(text);
-        if (classMatcher.find()) className = classMatcher.group(1);
-        Matcher matcher = JAVA_METHOD.matcher(text);
-        while (matcher.find()) {
-            String name = matcher.group(1);
-            int end = matchingBrace(text, matcher.end() - 1);
-            String body = text.substring(matcher.start(), end > 0 ? end : text.length());
-            Node node = addMethod(path, className + "." + name, "Java 方法", body, line(text, matcher.start()));
-            Matcher annotation = ANNOTATION_PATH.matcher(text.substring(Math.max(0, matcher.start() - 300), matcher.start()));
-            while (annotation.find()) node.endpoint = annotation.group(2);
+        try {
+            CompilationUnit unit = StaticJavaParser.parse(text);
+            String className = unit.getClassByName("未知類別").map(c -> c.getNameAsString()).orElseGet(() ->
+                    unit.findFirst(com.github.javaparser.ast.body.ClassOrInterfaceDeclaration.class)
+                            .map(c -> c.getNameAsString()).orElse("未知類別"));
+            unit.findAll(MethodDeclaration.class).forEach(method -> {
+                String name = method.getNameAsString();
+                String body = method.toString();
+                int methodLine = method.getBegin().map(p -> p.line).orElse(1);
+                Node node = addMethod(path, className + "." + name, "Java AST 方法", body, methodLine);
+
+                // 解析 Spring Mapping，讓 JSP／JS 的 URL 可以對應到 Controller 方法。
+                for (AnnotationExpr annotation : method.getAnnotations()) {
+                    Matcher mapping = ANNOTATION_PATH.matcher(annotation.toString());
+                    if (mapping.find()) node.endpoint = mapping.group(2);
+                }
+
+                // AST 精準取得方法呼叫，不再依賴整段文字猜測括號位置。
+                method.findAll(MethodCallExpr.class).forEach(call ->
+                        node.calls.add(call.getNameAsString()));
+            });
+            fileNode.label = className + "（Java AST 檔案）";
+        } catch (Exception e) {
+            warnings.add("Java AST 解析失敗：" + path + "，改用文字掃描，原因：" + e.getMessage());
+            fileNode.label = path.getFileName().toString() + "（Java 文字檔案）";
         }
-        fileNode.label = className + "（檔案）";
     }
 
     private void indexJs(Path path, String text, Node fileNode) {
@@ -190,7 +206,9 @@ public class SqlCallChainScanner {
         for (Node candidate : nodes.values()) {
             if (candidate == current) continue;
             String shortName = candidate.label.substring(candidate.label.lastIndexOf('.') + 1);
-            if (candidate.type.contains("方法") && body.matches("(?s).*\\b" + Pattern.quote(shortName) + "\\s*\\(.*")) {
+            if (candidate.type.contains("方法")
+                    && (current.calls.contains(shortName)
+                    || body.matches("(?s).*\\b" + Pattern.quote(shortName) + "\\s*\\(.*"))) {
                 result.add(candidate);
             }
             if (candidate.type.equals("檔案") && body.toLowerCase().contains(candidate.path.getFileName().toString().toLowerCase())) {
@@ -237,6 +255,7 @@ public class SqlCallChainScanner {
         String endpoint = "";
         int line = 1;
         boolean sql;
+        final Set<String> calls = new HashSet<>();
 
         Node(String id, Path path, String type, String label, String content) {
             this.id = id; this.path = path; this.type = type; this.label = label; this.content = content;
