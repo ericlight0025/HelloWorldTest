@@ -22,6 +22,30 @@ java -jar target/sql-call-chain-scanner-1.0.0.jar D:/legacy-system /order/query 
 java -jar target/sql-call-chain-scanner-1.0.0.jar D:/legacy-system POLICY_NO report.md
 ```
 
+## 內建範例程式
+
+`examples` 資料夾包含完整示範：
+
+```text
+order.jsp
+  ↓
+order.js：queryOrder()
+  ↓
+OrderController.java：queryOrder()
+  ↓
+OrderService.java：queryOrder()
+  ↓
+OrderRepository.java：findByOrderNo()
+  ↓
+order.sql：SELECT POLICY_NO ...
+```
+
+測試範例：
+
+```bash
+java -jar target/sql-call-chain-scanner-1.0.0.jar examples order.jsp examples-report.md
+```
+
 ## 注意事項
 
 這是靜態分析工具，會以檔案內容、方法名稱、Spring Mapping 與 SQL 關鍵字建立候選呼叫鏈。反射、AOP、XML 設定、動態 SQL、共用方法及框架代理可能需要人工確認。
