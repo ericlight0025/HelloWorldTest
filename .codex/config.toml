@@ -1,0 +1,2 @@
+# Use the high-capability Luna variant for remote tasks in this repository.
+model = "luna-6-max"
