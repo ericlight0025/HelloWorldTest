@@ -5,6 +5,9 @@ Java Controller／Service／Repository 使用 JavaParser AST 解析方法與方�
 
 ## 建置
 
+本專案以 JDK 11 為編譯與執行基準，建置前請確認 `java -version` 與
+`mvn -version` 使用 JDK 11。
+
 ```bash
 mvn clean package
 ```
